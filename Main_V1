@@ -1,0 +1,207 @@
+# --- Install dependencies ---
+!pip install openai pandas pdf2image pillow termcolor tqdm --quiet
+!apt-get install -y poppler-utils > /dev/null
+
+import openai
+import pandas as pd
+import re
+import base64
+import requests
+from pdf2image import convert_from_path
+from PIL import Image
+from IPython.display import display, HTML, Audio
+from google.colab import files
+from getpass import getpass
+from tqdm.notebook import tqdm
+from termcolor import colored
+import os
+import traceback
+
+def cprint(msg, state='info'):
+    icons = {'info': '🔷', 'success': '✅', 'error': '❌', 'debug': '👀', 'warn': '⚠️'}
+    colors = {'info': 'cyan', 'success': 'green', 'error': 'red', 'debug': 'magenta', 'warn': 'yellow'}
+    print(colored(f"{icons.get(state, 'ℹ️')} {msg}", colors.get(state, 'cyan')))
+
+cprint("Please upload your CSV (1st column should have Google Drive links):", 'info')
+uploaded = files.upload()
+csv_path = next(iter(uploaded))
+cprint("Now, please enter your OpenAI API Key (input box below is HIDDEN):", 'info')
+openai.api_key = getpass()
+
+def download_from_drive(file_id, dest):
+    cprint(f"Downloading Google Drive file_id {file_id} ...", 'info')
+    try:
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        r = requests.get(url)
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            f.write(r.content)
+        cprint(f"File saved as {dest}", 'debug')
+        return dest
+    except Exception as e:
+        cprint(f"FAILED to download {file_id}: {e}", 'error')
+        raise
+
+def get_file_type(filepath):
+    """Detect if file is PDF, image, html, or unknown."""
+    with open(filepath, 'rb') as f:
+        sig = f.read(8)
+        f.seek(0)
+        content = f.read(512)
+    if sig.startswith(b'%PDF'):
+        return 'pdf'
+    elif sig.startswith(b'\x89PNG'):
+        return 'png'
+    elif sig[:3] == b'\xff\xd8\xff':
+        return 'jpeg'
+    elif b'<html' in content.lower():
+        return 'html'
+    else:
+        return 'unknown'
+
+def pdf_to_images(pdf_path):
+    cprint(f"Converting PDF '{os.path.basename(pdf_path)}' to images...", 'info')
+    try:
+        images = convert_from_path(pdf_path)
+        image_paths = []
+        for i, image in enumerate(images):
+            img_path = f'/content/page_{i}_{os.path.basename(pdf_path)}.png'
+            image.save(img_path)
+            cprint(f"Page {i+1}: {img_path}", 'debug')
+            image_paths.append(img_path)
+        return image_paths
+    except Exception as e:
+        cprint(f"PDF conversion failed: {e}", 'error')
+        traceback.print_exc()
+        raise
+
+def image_to_base64(image_path):
+    try:
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode()
+    except Exception as e:
+        cprint(f"Couldn't base64 encode image {image_path}: {e}", 'error')
+        traceback.print_exc()
+        return None
+
+def extract_name_dob_from_image(image_path):
+    cprint(f"Extracting info from image: {os.path.basename(image_path)}", 'info')
+    image_b64 = image_to_base64(image_path)
+    if not image_b64:
+        return None, None
+    user_prompt = (
+        "From this document extract ONLY the person's full name and date of birth (DOB) if they exist. "
+        "Return the result in strict JSON format as {'name': '...', 'dob': 'dd-mmmm-yyyy'}"
+    )
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "user", "content": [
+                    {"type": "text", "text": user_prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}
+                ]}
+            ],
+            max_tokens=300
+        )
+        text_resp = response.choices[0].message.content
+        cprint(f"LLM Raw output: {text_resp}", 'debug')
+        data = re.search(r'\{.*\}', text_resp, re.DOTALL)
+        if data:
+            json_data = eval(data.group())
+            name = json_data.get('name')
+            dob = json_data.get('dob')
+            return name, dob
+        else:
+            cprint("No structured JSON found in response.", 'warn')
+            return None, None
+    except Exception as e:
+        cprint(f"OCR extraction error: {e}", 'error')
+        traceback.print_exc()
+        return None, None
+
+# --- Main Processing ---
+
+df = pd.read_csv(csv_path)
+output = []
+
+cprint(f"Processing {len(df)} files...", 'info')
+
+for idx, row in tqdm(df.iterrows(), total=len(df), desc="⏳ Records"):
+    cprint(f"\n==============\nRecord {idx+1}/{len(df)}", 'info')
+    drive_url = row['link']
+    cprint(f"Google Drive link: {drive_url}", 'debug')
+
+    match = re.search(r'id=([a-zA-Z0-9\-_]+)', drive_url)
+    if not match:
+        cprint("No file ID found in link!", 'error')
+        output.append({'link': drive_url, 'name': None, 'dob': None, 'error': 'No file id found'})
+        continue
+    file_id = match.group(1)
+    file_extension = os.path.splitext(drive_url)[1] or ""
+    local_path = f"/content/file_{file_id}{file_extension}"
+
+    try:
+        download_from_drive(file_id, local_path)
+        ftype = get_file_type(local_path)
+        cprint(f"Detected file type: {ftype}", 'debug')
+        if ftype == 'pdf':
+            images = pdf_to_images(local_path)
+        elif ftype in ['png', 'jpeg']:
+            images = [local_path]
+        elif ftype == 'html':
+            # Print a bit of the file for debugging
+            with open(local_path, "rb") as f:
+                cprint("First 512 bytes of HTML file:", 'debug')
+                html_sample = f.read(512)
+                try:
+                    cprint(html_sample.decode(errors="replace"), 'debug')
+                except Exception:
+                    pass
+            cprint(f"File {local_path} is HTML, likely a Google Drive error/quota/interstitial!", 'error')
+            output.append({'link': drive_url, 'name': None, 'dob': None, 'error': 'Drive HTML error/quota'})
+            continue
+        else:
+            cprint(f"Unsupported or unknown file type for {local_path}", 'error')
+            output.append({'link': drive_url, 'name': None, 'dob': None, 'error': 'Unknown or unsupported file type'})
+            continue
+
+        name = dob = None
+        for page_idx, img in enumerate(images):
+            cprint(f"Processing image/page {page_idx+1} of {len(images)}...", 'info')
+            name, dob = extract_name_dob_from_image(img)
+            if name and dob:
+                cprint("Extraction succeeded.", 'success')
+                break
+        success = name is not None and dob is not None
+        output.append({
+            'link': drive_url,
+            'name': name,
+            'dob': dob,
+            'error': None if success else 'Extraction failed'
+        })
+        cprint(f"RESULT → Name: {name}, DOB: {dob}", 'success' if success else 'warn')
+    except Exception as e:
+        cprint(f"File processing failed: {e}", 'error')
+        traceback.print_exc()
+        output.append({'link': drive_url, 'name': None, 'dob': None, 'error': str(e)})
+
+# --- Save & Preview ---
+result_df = pd.DataFrame(output)
+result_path = '/content/extracted_name_dob.csv'
+result_df.to_csv(result_path, index=False)
+cprint("\n========== SUMMARY ==========", 'info')
+
+def color_fail(val):
+    color = '#fbe7e7' if pd.isnull(val) or str(val).lower() == 'none' else '#bdf7b7'
+    return f'background-color: {color}'
+
+display(HTML(result_df.style.applymap(color_fail, subset=['name','dob']).set_caption("Extraction Results").to_html()))
+
+files.download(result_path)
+cprint("Extraction completed 🎉. File is ready for download.", 'success')
+
+try:
+    display(Audio(url="https://actions.google.com/sounds/v1/alarms/beep_short.ogg", autoplay=True))
+except:
+    pass
